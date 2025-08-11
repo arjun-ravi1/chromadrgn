@@ -379,8 +379,10 @@ def train_batch(
 ):
     optim.zero_grad()
     model.train()
-    if trans is not None:
-        y = preprocess_input(y, lattice, trans)
+  
+    z_mu, z_logvar, z, y_recon, mask = run_batch(
+    model, lattice, y, conditioner=conditioner, ctf_params=ctf_params, yr=yr
+)
 
     # Cast operations to mixed precision if using torch.cuda.amp.GradScaler()
     if scaler is not None:
@@ -955,7 +957,6 @@ def main(args: argparse.Namespace) -> None:
                 if args.dose_per_tilt is not None:
                     dose_filters = data.get_dose_filters(tilt_ind, lattice, Apix)
             else:
-                rot, tran = posetracker.get_pose(ind)
                 ctf_param = ctf_params[ind] if ctf_params is not None else None
 
             loss, gen_loss, kld = train_batch(
