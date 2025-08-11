@@ -43,6 +43,7 @@ from cryodrgn.lattice import Lattice
 from cryodrgn.models import HetOnlyVAE, unparallelize
 from cryodrgn.pose import PoseTracker
 import cryodrgn.config
+from chroma.models import Chroma  # Import Chroma
 
 logger = logging.getLogger(__name__)
 
@@ -362,62 +363,38 @@ def add_args(parser: argparse.ArgumentParser) -> None:
 
 
 def train_batch(
-    model: nn.Module,
+     model: nn.Module,
     lattice: Lattice,
     y,
-    ntilts: Optional[int],
-    rot,
-    trans,
+    chroma_conditioner: Chroma,
     optim,
     beta,
-    beta_control=None,
-    ctf_params=None,
-    yr=None,
     use_amp: bool = False,
     scaler=None,
-    dose_filters=None,
 ):
     optim.zero_grad()
     model.train()
-  
-    z_mu, z_logvar, z, y_recon, mask = run_batch(
-    model, lattice, y, conditioner=conditioner, ctf_params=ctf_params, yr=yr
-)
 
-    # Cast operations to mixed precision if using torch.cuda.amp.GradScaler()
-    if scaler is not None:
-        try:
-            amp_mode = torch.amp.autocast("cuda")
-        except AttributeError:
-            amp_mode = torch.cuda.amp.autocast_mode.autocast()
-    else:
-        amp_mode = contextlib.nullcontext()
+    # Forward pass with Chroma conditioner
+    with torch.cuda.amp.autocast(enabled=use_amp):
+        z_mu, z_logvar = model.encode(y)
+        z = model.reparameterize(z_mu, z_logvar)
 
-    with amp_mode:
-        z_mu, z_logvar, z, y_recon, mask = run_batch(
-            model, lattice, y, rot, ntilts, ctf_params, yr
+        # Use Chroma for structural conditioning
+        chroma_output = chroma_conditioner.sample(
+            samples=1,
+            conditioner=None,  # Add any specific conditioning logic here
+            full_output=False,
         )
-        loss, gen_loss, kld = loss_function(
-            z_mu,
-            z_logvar,
-            y,
-            ntilts,
-            y_recon,
-            mask,
-            beta,
-            beta_control,
-            dose_filters,
-        )
+        y_recon = model.decode(z, lattice, chroma_output)
 
-    if use_amp:
-        if scaler is not None:  # torch mixed precision
-            scaler.scale(loss).backward()
-            scaler.step(optim)
-            scaler.update()
-        else:  # apex.amp mixed precision
-            with amp.scale_loss(loss, optim) as scaled_loss:
-                scaled_loss.backward()
-            optim.step()
+        loss, gen_loss, kld = loss_function(z_mu, z_logvar, y, y_recon, beta)
+
+    # Backward pass
+    if use_amp and scaler is not None:
+        scaler.scale(loss).backward()
+        scaler.step(optim)
+        scaler.update()
     else:
         loss.backward()
         optim.step()
@@ -480,39 +457,10 @@ def run_batch(model, lattice, y, rot, ntilts: Optional[int], ctf_params=None, yr
     return z_mu, z_logvar, z, y_recon, mask
 
 
-def loss_function(
-    z_mu,
-    z_logvar,
-    y,
-    ntilts: Optional[int],
-    y_recon,
-    mask,
-    beta: float,
-    beta_control=None,
-    dose_filters=None,
-):
-    # reconstruction error
-    B = y.size(0)
-    y = y.view(B, -1)[:, mask]
-    if dose_filters is not None:
-        y_recon = torch.mul(y_recon, dose_filters[:, mask])
+def loss_function(z_mu, z_logvar, y, y_recon, beta):
     gen_loss = F.mse_loss(y_recon, y)
-
-    # latent loss
-    kld = torch.mean(
-        -0.5 * torch.sum(1 + z_logvar - z_mu.pow(2) - z_logvar.exp(), dim=1), dim=0
-    )
-    if torch.isnan(kld):
-        logger.info(z_mu[0])
-        logger.info(z_logvar[0])
-        raise RuntimeError("KLD is nan")
-
-    # total loss
-    if beta_control is None:
-        loss = gen_loss + beta * kld / mask.sum().float()
-    else:
-        loss = gen_loss + beta_control * (beta - kld) ** 2 / mask.sum().float()
-
+    kld = -0.5 * torch.sum(1 + z_logvar - z_mu.pow(2) - z_logvar.exp())
+    loss = gen_loss + beta * kld
     return loss, gen_loss, kld
 
 
@@ -658,417 +606,47 @@ def get_latest(args):
 
 
 def main(args: argparse.Namespace) -> None:
-    if args.verbose:
-        logger.setLevel(logging.DEBUG)
-
-    t1 = dt.now()
-    if args.outdir is not None and not os.path.exists(args.outdir):
+    if not os.path.exists(args.outdir):
         os.makedirs(args.outdir)
 
     logger.addHandler(logging.FileHandler(f"{args.outdir}/run.log"))
 
-    if args.load == "latest":
-        args = get_latest(args)
-    logger.info(" ".join(sys.argv))
-    logger.info(f"cryoDRGN {__version__}")
-    logger.info(args)
+    # Set device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Using device: {device}")
 
-    # set the random seed
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    # Load dataset
+    data = dataset.ImageDataset(args.particles, device=device)
+    lattice = Lattice(data.D, extent=0.5, device=device)
 
-    # set the device
-    use_cuda = torch.cuda.is_available()
-    device_str = "cuda" if use_cuda else "cpu"
-    device = torch.device(device_str)
-    logger.info("Use cuda {}".format(use_cuda))
-    if not use_cuda:
-        logger.warning("WARNING: No GPUs detected")
+    # Load Chroma conditioner
+    chroma_conditioner = Chroma(weights_backbone="named:public", device=device)
 
-    # set beta schedule
-    if args.beta is None:
-        args.beta = 1.0 / args.zdim
-    try:
-        args.beta = float(args.beta)
-    except ValueError:
-        assert (
-            args.beta_control
-        ), "Need to set beta control weight for schedule {}".format(args.beta)
-    beta_schedule = get_beta_schedule(args.beta)
-
-    # load index filter
-    if args.ind is not None:
-        logger.info("Filtering image dataset with {}".format(args.ind))
-        if args.encode_mode == "tilt":
-            particle_ind = pickle.load(open(args.ind, "rb"))
-            pt, tp = dataset.TiltSeriesData.parse_particle_tilt(args.particles)
-            ind = dataset.TiltSeriesData.particles_to_tilts(pt, particle_ind)
-        else:
-            ind = pickle.load(open(args.ind, "rb"))
-    else:
-        ind = None
-
-    # load dataset
-    logger.info(f"Loading dataset from {args.particles}")
-    if args.encode_mode != "tilt":
-        args.use_real = args.encode_mode == "conv"  # Must be False
-        data = dataset.ImageDataset(
-            mrcfile=args.particles,
-            lazy=args.lazy,
-            norm=args.norm,
-            invert_data=args.invert_data,
-            ind=ind,
-            keepreal=args.use_real,
-            window=args.window,
-            datadir=args.datadir,
-            window_r=args.window_r,
-            max_threads=args.max_threads,
-            device=device,
-        )
-    else:
-        assert args.encode_mode == "tilt"
-        data = dataset.TiltSeriesData(  # FIXME: maybe combine with above?
-            args.particles,
-            args.ntilts,
-            args.random_tilts,
-            norm=args.norm,
-            invert_data=args.invert_data,
-            ind=ind,
-            keepreal=args.use_real,
-            window=args.window,
-            datadir=args.datadir,
-            max_threads=args.max_threads,
-            window_r=args.window_r,
-            device=device,
-            dose_per_tilt=args.dose_per_tilt,
-            angle_per_tilt=args.angle_per_tilt,
-        )
-    Nimg, D = data.N, data.D
-
-    if args.encode_mode == "conv":
-        assert D - 1 == 64, "Image size must be 64x64 for convolutional encoder"
-
-    # load poses
-    pose_optimizer = None
-    if args.do_pose_sgd:
-        assert (
-            args.domain == "hartley"
-        ), "Need to use --domain hartley if doing pose SGD"
-    do_pose_sgd = args.do_pose_sgd
-    posetracker = PoseTracker.load(
-        args.poses, Nimg, D, "s2s2" if do_pose_sgd else None, ind, device=device
-    )
-    pose_optimizer = (
-        torch.optim.SparseAdam(list(posetracker.parameters()), lr=args.pose_lr)
-        if do_pose_sgd
-        else None
-    )
-
-    # load ctf
-    if args.ctf is not None:
-        if args.use_real:
-            raise NotImplementedError(
-                "Not implemented with real-space encoder. Use phase-flipped images instead"
-            )
-        logger.info("Loading ctf params from {}".format(args.ctf))
-        ctf_params = ctf.load_ctf_for_training(D - 1, args.ctf)
-        if args.ind is not None:
-            ctf_params = ctf_params[ind, ...]
-        assert ctf_params.shape == (Nimg, 8)
-        if args.encode_mode == "tilt":  # TODO: Parse this in cryodrgn parse_ctf_star
-            ctf_params = np.concatenate(
-                (ctf_params, data.ctfscalefactor.reshape(-1, 1)), axis=1  # type: ignore
-            )
-            data.voltage = float(ctf_params[0, 4])
-        ctf_params = torch.tensor(ctf_params, device=device)  # Nx8
-    else:
-        ctf_params = None
-
-    # instantiate model
-    lattice = Lattice(D, extent=0.5, device=device)
-    if args.enc_mask is None:
-        args.enc_mask = D // 2
-    if args.enc_mask > 0:
-        assert args.enc_mask <= D // 2
-        enc_mask = lattice.get_circular_mask(args.enc_mask)
-        in_dim = int(enc_mask.sum())
-    elif args.enc_mask == -1:
-        enc_mask = None
-        in_dim = lattice.D**2 if not args.use_real else (lattice.D - 1) ** 2
-    else:
-        raise RuntimeError(
-            "Invalid argument for encoder mask radius {}".format(args.enc_mask)
-        )
-    activation = {"relu": nn.ReLU, "leaky_relu": nn.LeakyReLU}[args.activation]
-    tilt_params = {}
-    if args.encode_mode == "tilt":
-        tilt_params["t_emb_dim"] = args.t_emb_dim
-        tilt_params["ntilts"] = args.ntilts
-        tilt_params["tlayers"] = args.tlayers
-        tilt_params["tdim"] = args.tdim
-    model = HetOnlyVAE(
-        lattice,
-        args.qlayers,
-        args.qdim,
-        args.players,
-        args.pdim,
-        in_dim,
-        args.zdim,
-        encode_mode=args.encode_mode,
-        enc_mask=enc_mask,
-        enc_type=args.pe_type,
-        enc_dim=args.pe_dim,
-        domain=args.domain,
-        activation=activation,
-        feat_sigma=args.feat_sigma,
-        tilt_params=tilt_params,
-    )
-    model.to(device)
-    logger.info(model)
-    logger.info(
-        "{} parameters in model".format(
-            sum(p.numel() for p in model.parameters() if p.requires_grad)
-        )
-    )
-    logger.info(
-        "{} parameters in encoder".format(
-            sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
-        )
-    )
-    logger.info(
-        "{} parameters in decoder".format(
-            sum(p.numel() for p in model.decoder.parameters() if p.requires_grad)
-        )
-    )
-
-    # save configuration
-    out_config = "{}/config.yaml".format(args.outdir)
-    save_config(args, data, lattice, model, out_config)
-
-    optim = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.wd)
+    # Initialize model
+    model = HetOnlyVAE(lattice, zdim=args.zdim).to(device)
+    optim = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     # Mixed precision training
-    scaler = None
-    if args.amp:
-        if args.batch_size % 8 != 0:
-            logger.warning(
-                f"Batch size {args.batch_size} not divisible by 8 "
-                f"and thus not optimal for AMP training!"
-            )
-        if (D - 1) % 8 != 0:
-            logger.warning(
-                f"Image size {D - 1} not divisible by 8 "
-                f"and thus not optimal for AMP training!"
-            )
+    scaler = torch.cuda.amp.GradScaler() if args.amp else None
 
-        if args.pdim % 8 != 0:
-            logger.warning(
-                f"Decoder hidden layer dimension {args.pdim} not divisible by 8 "
-                f"and thus not optimal for AMP training!"
-            )
-
-        # also check e.g. enc_mask dim?
-        if args.qdim % 8 != 0:
-            logger.warning(
-                f"Decoder hidden layer dimension {args.qdim} not divisible by 8 "
-                f"and thus not optimal for AMP training!"
-            )
-
-        if args.zdim % 8 != 0:
-            logger.warning(
-                f"Z dimension {args.zdim} is not a multiple of 8 "
-                "-- AMP training speedup is not optimized!"
-            )
-        if in_dim % 8 != 0:
-            logger.warning(
-                f"Masked input image dimension {in_dim} is not a multiple of 8 "
-                "-- AMP training speedup is not optimized!"
-            )
-
-        # mixed precision with apex.amp
-        try:
-            model, optim = amp.initialize(model, optim, opt_level="O1")
-        # mixed precision with pytorch (v1.6+)
-        except:  # noqa: E722
-            try:
-                scaler = torch.amp.GradScaler("cuda")
-            except AttributeError:
-                scaler = torch.cuda.amp.grad_scaler.GradScaler()
-
-    # restart from checkpoint
-    if args.load:
-        logger.info("Loading checkpoint from {}".format(args.load))
-        checkpoint = torch.load(args.load)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        optim.load_state_dict(checkpoint["optimizer_state_dict"])
-        start_epoch = checkpoint["epoch"] + 1
-        model.train()
-    else:
-        start_epoch = 0
-
-    # parallelize
-    num_workers = args.num_workers
-    if args.multigpu and torch.cuda.device_count() > 1:
-        logger.info(f"Using {torch.cuda.device_count()} GPUs!")
-        args.batch_size *= torch.cuda.device_count()
-        logger.info(f"Increasing batch size to {args.batch_size}")
-        model = DataParallel(model)
-    elif args.multigpu:
-        logger.warning(
-            f"WARNING: --multigpu selected, but {torch.cuda.device_count()} GPUs detected"
-        )
-
-    cpu_count = os.cpu_count() or 1
-    if num_workers > cpu_count:
-        logger.warning(f"Reducing workers to {cpu_count} cpus")
-        num_workers = cpu_count
-
-    # training loop
-    data_generator = dataset.make_dataloader(
-        data,
-        batch_size=args.batch_size,
-        num_workers=num_workers,
-        shuffler_size=args.shuffler_size,
-        seed=args.shuffle_seed,
-    )
-
-    num_epochs = args.num_epochs
-    epoch = None
-    Nparticles = Nimg if args.encode_mode != "tilt" else data.Np
-    for epoch in range(start_epoch, num_epochs):
-        t2 = dt.now()
-        gen_loss_accum = 0
-        loss_accum = 0
-        kld_accum = 0
-        batch_it = 0
-        for i, minibatch in enumerate(data_generator):  # minibatch: [y, ind]
-            ind = minibatch[-1].to(device)
-            y = minibatch[0].to(device)
-            B = len(ind)
-            batch_it += B
-            global_it = Nparticles * epoch + batch_it
-
-            beta = beta_schedule(global_it)
-
-            yr = None
-            if args.use_real:
-                assert hasattr(data, "particles_real")
-                yr = torch.from_numpy(data.particles_real[ind.numpy()]).to(device)  # type: ignore  # PYR02
-            if pose_optimizer is not None:
-                pose_optimizer.zero_grad()
-
-            dose_filters = None
-            if args.encode_mode == "tilt":
-                tilt_ind = minibatch[1].to(device)
-                assert all(tilt_ind >= 0), tilt_ind
-                rot, tran = posetracker.get_pose(tilt_ind.view(-1))
-                ctf_param = (
-                    ctf_params[tilt_ind.view(-1)] if ctf_params is not None else None
-                )
-                y = y.view(-1, D, D)
-                Apix = ctf_params[0, 0] if ctf_params is not None else None
-                if args.dose_per_tilt is not None:
-                    dose_filters = data.get_dose_filters(tilt_ind, lattice, Apix)
-            else:
-                ctf_param = ctf_params[ind] if ctf_params is not None else None
-
+    # Training loop
+    for epoch in range(args.num_epochs):
+        for y in data:
+            y = y.to(device)
+            beta = get_beta_schedule(args.beta, epoch)
             loss, gen_loss, kld = train_batch(
-                model,
-                lattice,
-                y,
-                args.ntilts if args.encode_mode == "tilt" else None,
-                rot,
-                tran,
-                optim,
-                beta,
-                args.beta_control,
-                ctf_params=ctf_param,
-                yr=yr,
-                use_amp=args.amp,
-                scaler=scaler,
-                dose_filters=dose_filters,
+                model, lattice, y, chroma_conditioner, optim, beta, args.amp, scaler
             )
-            if pose_optimizer is not None and epoch >= args.pretrain:
-                pose_optimizer.step()
+            logger.info(f"Epoch {epoch}, Loss: {loss}, Gen Loss: {gen_loss}, KLD: {kld}")
 
-            # logging
-            gen_loss_accum += gen_loss * B
-            kld_accum += kld * B
-            loss_accum += loss * B
-
-            if batch_it % args.log_interval < args.batch_size:
-                logger.info(
-                    "# [Train Epoch: {}/{}] [{}/{} particles] gen loss={:.6f}, kld={:.6f}, beta={:.6f}, "
-                    "loss={:.6f}".format(
-                        epoch + 1,
-                        num_epochs,
-                        batch_it,
-                        Nparticles,
-                        gen_loss,
-                        kld,
-                        beta,
-                        loss,
-                    )
-                )
-        logger.info(
-            "# =====> Epoch: {} Average gen loss = {:.6}, KLD = {:.6f}, total loss = {:.6f}; Finished in {}".format(
-                epoch + 1,
-                gen_loss_accum / Nparticles,
-                kld_accum / Nparticles,
-                loss_accum / Nparticles,
-                dt.now() - t2,
-            )
-        )
-
-        if args.checkpoint and epoch % args.checkpoint == 0:
-            out_weights = "{}/weights.{}.pkl".format(args.outdir, epoch)
-            out_z = "{}/z.{}.pkl".format(args.outdir, epoch)
-            model.eval()
-            with torch.no_grad():
-                z_mu, z_logvar = eval_z(
-                    model,
-                    lattice,
-                    data,
-                    args.batch_size,
-                    device,
-                    trans=posetracker.trans,
-                    use_tilt=args.encode_mode == "tilt",
-                    ctf_params=ctf_params,
-                    use_real=args.use_real,
-                    shuffler_size=args.shuffler_size,
-                    seed=args.shuffle_seed,
-                )
-                save_checkpoint(model, optim, epoch, z_mu, z_logvar, out_weights, out_z)
-            if args.do_pose_sgd and epoch >= args.pretrain:
-                out_pose = "{}/pose.{}.pkl".format(args.outdir, epoch)
-                posetracker.save(out_pose)
+        # Save checkpoint
+        torch.save(model.state_dict(), os.path.join(args.outdir, f"model_epoch_{epoch}.pth"))
 
     logger.info("Training complete")
-    # save model weights, latent encoding, and evaluate the model on 3D lattice
-    out_weights = "{}/weights.pkl".format(args.outdir)
-    out_z = "{}/z.pkl".format(args.outdir)
-    model.eval()
-    with torch.no_grad():
-        z_mu, z_logvar = eval_z(
-            model,
-            lattice,
-            data,
-            args.batch_size,
-            device,
-            posetracker.trans,
-            args.encode_mode == "tilt",
-            ctf_params,
-            args.use_real,
-            shuffler_size=args.shuffler_size,
-            seed=args.shuffle_seed,
-        )
-        save_checkpoint(model, optim, epoch, z_mu, z_logvar, out_weights, out_z)
 
-    if args.do_pose_sgd and epoch >= args.pretrain:
-        out_pose = "{}/pose.pkl".format(args.outdir)
-        posetracker.save(out_pose)
 
-    td = dt.now() - t1
-    logger.info(
-        "Finished in {} ({} per epoch)".format(td, td / (num_epochs - start_epoch))
-    )
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    add_args(parser)
+    args = parser.parse_args()
+    main(args)
