@@ -460,7 +460,20 @@ def run_batch(model, lattice, y, rot, ntilts: Optional[int], ctf_params=None, yr
 
     # decode
     mask = lattice.get_circular_mask(D // 2)  # restrict to circular mask
-    y_recon = model(lattice.coords[mask] / lattice.extent / 2 @ rot, z).view(B, -1)
+    batch_outs = model.backbone_network.sample_sde(
+      lattice.coords[mask],
+      X_init=z,
+      conditioner=conditioner,
+      tspan=[1.0, 0.001],
+      langevin_isothermal=False,
+      integrate_func="euler_maruyama",
+      sde_func="reverse_sde",
+      langevin_factor=2,
+      inverse_temperature=10,
+      N=500,
+      initialize_noise=True,
+    )
+    y_recon = batch_outs["X_sample"]
     if c is not None:
         y_recon *= c.view(B, -1)[:, mask]
 
