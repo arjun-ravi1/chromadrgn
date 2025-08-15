@@ -44,6 +44,7 @@ from cryodrgn.models import HetOnlyVAE, unparallelize
 from cryodrgn.pose import PoseTracker
 import cryodrgn.config
 from chroma.models import Chroma  # Import Chroma
+from chroma import Protein
 
 logger = logging.getLogger(__name__)
 
