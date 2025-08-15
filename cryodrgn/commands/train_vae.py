@@ -366,17 +366,18 @@ def add_args(parser: argparse.ArgumentParser) -> None:
 def train_batch(
      model: nn.Module,
     lattice: Lattice,
-    y,
+    y: torch.Tensor,
+    ctf_param: torch.Tensor,
     chroma: Chroma,
     optim,
-    beta,
+    beta: float,
     use_amp: bool = False,
     scaler=None,
 ):
     optim.zero_grad()
     model.train()
 
-    # Forward pass with Chroma conditioner
+    # forward pass with Chroma conditioner
     with torch.cuda.amp.autocast(enabled=use_amp):
         z_mu, z_logvar = model.encode(y)
         z = model.reparameterize(z_mu, z_logvar)
@@ -388,7 +389,11 @@ def train_batch(
             full_output=False,
         )
         y_recon = model.decode(z, lattice, chroma_output)
-
+          
+        z_mu, z_logvar, z, y_recon, mask = run_batch(
+          model, lattice, y, rot, ntilts, ctf_params, yr
+        )
+        # compute VAE loss
         loss, gen_loss, kld = loss_function(z_mu, z_logvar, y, y_recon, beta)
 
     # Backward pass
