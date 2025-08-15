@@ -367,7 +367,7 @@ def train_batch(
      model: nn.Module,
     lattice: Lattice,
     y,
-    chroma_conditioner: Chroma,
+    chroma: Chroma,
     optim,
     beta,
     use_amp: bool = False,
@@ -382,9 +382,9 @@ def train_batch(
         z = model.reparameterize(z_mu, z_logvar)
 
         # Use Chroma for structural conditioning
-        chroma_output = chroma_conditioner.sample(
+        chroma_output = chroma.sample(
             samples=1,
-            conditioner=None,  # Add any specific conditioning logic here
+            conditioner=None,  #Add conditioners here
             full_output=False,
         )
         y_recon = model.decode(z, lattice, chroma_output)
@@ -615,13 +615,14 @@ def main(args: argparse.Namespace) -> None:
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
+    chroma = Chroma().to(device)
 
     # Load dataset
     data = dataset.ImageDataset(args.particles, device=device)
     lattice = Lattice(data.D, extent=0.5, device=device)
 
     # Load Chroma conditioner
-    chroma_conditioner = Chroma(weights_backbone="named:public", device=device)
+    chroma = Chroma(weights_backbone="named:public", device=device)
 
     # Initialize model
     model = HetOnlyVAE(lattice, zdim=args.zdim).to(device)
@@ -636,7 +637,7 @@ def main(args: argparse.Namespace) -> None:
             y = y.to(device)
             beta = get_beta_schedule(args.beta, epoch)
             loss, gen_loss, kld = train_batch(
-                model, lattice, y, chroma_conditioner, optim, beta, args.amp, scaler
+                model, lattice, y, chroma, optim, beta, args.amp, scaler
             )
             logger.info(f"Epoch {epoch}, Loss: {loss}, Gen Loss: {gen_loss}, KLD: {kld}")
 
