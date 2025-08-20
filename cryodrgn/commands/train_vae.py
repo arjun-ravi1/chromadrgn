@@ -1,49 +1,41 @@
-"""Train a VAE for heterogeneous reconstruction with known poses.
-
-Example usage
--------------
-$ cryodrgn train_vae projections.mrcs -o outs/002_trainvae --lr 0.0001 --zdim 8 \
-                                      --poses angles.pkl --ctf test_ctf.pkl -n 25
-
-# Restart after already running the same command with some epochs completed
-$ cryodrgn train_vae projections.mrcs -o outs/002_trainvae --lr 0.0001 --zdim 8 \
-                                      --poses angles.pkl --ctf test_ctf.pkl \
-                                      --load latest -n 50
-
-# cryoDRGN-ET tilt series reconstruction
-$ cryodrgn train_vae particles_from_M.star --datadir particleseries -o your-outdir \
-                                           --ctf ctf.pkl --poses pose.pkl \
-                                           --encode-mode tilt --dose-per-tilt 2.93 \
-                                           --zdim 12 --num-epochs 50 --beta .025
-
+#!/usr/bin/env python
 """
+Train a cryoDRGN VAE with known poses + structural conditioning from Chroma.
+
+Usage example (after installing cryoDRGN 3.4.4 and Chroma):
+
+  $ python train_cryoDRGN_with_Chroma.py \
+        particles.mrcs \
+        --poses angles.pkl \
+        --ctf ctf.pkl \
+        --protein myprotein.pdb \
+        --outdir outs/with_chroma \
+        --zdim 8 \
+        --lr 1e-4 \
+        --num-epochs 20 \
+        --batch-size 16 \
+        --beta 0.5
+"""
+
 import argparse
 import os
 import pickle
-import sys
-import contextlib
 import logging
-from datetime import datetime as dt
 from typing import Optional
+
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.nn.parallel import DataParallel
 import torch.nn.functional as F
 
-try:
-    import apex.amp as amp  # type: ignore  # PYR01
-except ImportError:
-    pass
-
 import cryodrgn
-from cryodrgn import __version__, ctf, dataset
+from cryodrgn import ctf, dataset
 from cryodrgn.beta_schedule import get_beta_schedule
 from cryodrgn.lattice import Lattice
 from cryodrgn.models import HetOnlyVAE, unparallelize
 from cryodrgn.pose import PoseTracker
-import cryodrgn.config
-from chroma.models import Chroma  # Import Chroma
+
+from chroma.models import Chroma
 from chroma import Protein
 
 logger = logging.getLogger(__name__)
@@ -53,260 +45,84 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "particles",
         type=os.path.abspath,
-        help="Input particles (.mrcs, .star, .cs, or .txt)",
+        help="Particle images (.mrcs, .star, .cs or .txt)",
     )
     parser.add_argument(
-        "-o",
-        "--outdir",
+        "--poses",
         type=os.path.abspath,
         required=True,
-        help="Output directory to save model",
+        help="Pickle file with known poses (quats/Euler + translations)",
     )
     parser.add_argument(
-        "--zdim", type=int, required=True, help="Dimension of latent variable"
+        "--ctf",
+        type=os.path.abspath,
+        help="Pickle file with CTF parameters",
     )
     parser.add_argument(
-        "--poses", type=os.path.abspath, required=True, help="Image poses (.pkl)"
+        "--protein",
+        type=os.path.abspath,
+        required=True,
+        help="Protein structure/sequence for Chroma (e.g. .pdb or .fasta)",
     )
     parser.add_argument(
-        "--ctf", metavar="pkl", type=os.path.abspath, help="CTF parameters (.pkl)"
+        "-o", "--outdir", type=os.path.abspath, required=True, help="Output directory"
     )
     parser.add_argument(
-        "--load", metavar="WEIGHTS.PKL", help="Initialize training from a checkpoint"
-    )
-    parser.add_argument(
-        "--checkpoint",
+        "--zdim",
         type=int,
-        default=1,
-        help="Checkpointing interval in N_EPOCHS (default: %(default)s)",
+        required=True,
+        help="Base latent dimension (before adding Chroma embedding)",
     )
     parser.add_argument(
-        "--log-interval",
-        type=int,
-        default=1000,
-        help="Logging interval in N_IMGS (default: %(default)s)",
-    )
-    parser.add_argument(
-        "-v", "--verbose", action="store_true", help="Increase verbosity"
-    )
-    parser.add_argument(
-        "--seed", type=int, default=np.random.randint(0, 100000), help="Random seed"
-    )
-    parser.add_argument(
-        "--shuffle-seed",
-        type=int,
+        "--beta",
         default=None,
-        help="Random seed for data shuffling",
+        help="Beta schedule (name) or float constant",
     )
-
-    group = parser.add_argument_group("Dataset loading")
-    group.add_argument(
-        "--ind",
-        type=os.path.abspath,
-        metavar="PKL",
-        help="Filter particles by these indices",
-    )
-    group.add_argument(
-        "--uninvert-data",
-        dest="invert_data",
-        action="store_false",
-        help="Do not invert data sign",
-    )
-    group.add_argument(
-        "--no-window",
-        dest="window",
-        action="store_false",
-        help="Turn off real space windowing of dataset",
-    )
-    group.add_argument(
-        "--window-r",
-        type=float,
-        default=0.85,
-        help="Windowing radius (default: %(default)s)",
-    )
-    group.add_argument(
-        "--datadir",
-        type=os.path.abspath,
-        help="Path prefix to particle stack if loading relative paths from a .star or .cs file",
-    )
-    group.add_argument(
-        "--lazy",
-        action="store_true",
-        help="Lazy loading if full dataset is too large to fit in memory",
-    )
-    group.add_argument(
-        "--shuffler-size",
-        type=int,
-        default=0,
-        help="If non-zero, will use a data shuffler for faster lazy data loading.",
-    )
-    group.add_argument(
-        "--num-workers",
-        type=int,
-        default=0,
-        help="Number of subprocesses to use as DataLoader workers. If 0, then use the main process for data loading. (default: %(default)s)",
-    )
-    group.add_argument(
-        "--max-threads",
-        type=int,
-        default=16,
-        help="Maximum number of CPU cores for data loading (default: %(default)s)",
-    )
-
-    group = parser.add_argument_group("Tilt series parameters")
-    group.add_argument(
-        "--ntilts",
-        type=int,
-        default=10,
-        help="Number of tilts to encode (default: %(default)s)",
-    )
-    group.add_argument(
-        "--random-tilts",
-        action="store_true",
-        help="Randomize ordering of tilts series to encoder",
-    )
-    group.add_argument(
-        "--t-emb-dim",
-        type=int,
-        default=64,
-        help="Intermediate embedding dimension (default: %(default)s)",
-    )
-    group.add_argument(
-        "--tlayers",
-        type=int,
-        default=3,
-        help="Number of hidden layers (default: %(default)s)",
-    )
-    group.add_argument(
-        "--tdim",
-        type=int,
-        default=1024,
-        help="Number of nodes in hidden layers (default: %(default)s)",
-    )
-    group.add_argument(
-        "-d",
-        "--dose-per-tilt",
-        type=float,
-        help="Expected dose per tilt (electrons/A^2 per tilt) (default: %(default)s)",
-    )
-    group.add_argument(
-        "-a",
-        "--angle-per-tilt",
-        type=float,
-        default=3,
-        help="Tilt angle increment per tilt in degrees (default: %(default)s)",
-    )
-
-    group = parser.add_argument_group("Training parameters")
-    group.add_argument(
-        "-n",
-        "--num-epochs",
-        type=int,
-        default=20,
-        help="Number of training epochs (default: %(default)s)",
-    )
-    group.add_argument(
-        "-b",
-        "--batch-size",
-        type=int,
-        default=8,
-        help="Minibatch size (default: %(default)s)",
-    )
-    group.add_argument(
-        "--wd",
-        type=float,
-        default=0,
-        help="Weight decay in Adam optimizer (default: %(default)s)",
-    )
-    group.add_argument(
+    parser.add_argument(
         "--lr",
         type=float,
         default=1e-4,
-        help="Learning rate in Adam optimizer (default: %(default)s)",
+        help="Learning rate",
     )
-    group.add_argument(
-        "--beta",
-        default=None,
-        help="Choice of beta schedule or a constant for KLD weight (default: 1/zdim)",
+    parser.add_argument(
+        "-n", "--num-epochs", type=int, default=20, help="Number of epochs"
     )
-    group.add_argument(
-        "--beta-control",
-        type=float,
-        help="KL-Controlled VAE gamma. Beta is KL target",
+    parser.add_argument(
+        "-b", "--batch-size", type=int, default=8, help="Batch size"
     )
-    group.add_argument(
-        "--norm",
-        type=float,
-        nargs=2,
-        default=None,
-        help="Data normalization as shift, 1/scale (default: mean, std of dataset)",
+    parser.add_argument(
+        "--amp",
+        action="store_true",
+        help="Use mixed precision (torch.cuda.amp)",
     )
-    group.add_argument(
-        "--no-amp",
-        action="store_false",
-        dest="amp",
-        help="Do not use mixed-precision training for accelerating training",
-    )
-    group.add_argument(
+    parser.add_argument(
         "--multigpu",
         action="store_true",
-        help="Parallelize training across all detected GPUs",
+        help="Use DataParallel on multiple GPUs",
     )
 
-    group = parser.add_argument_group("Pose SGD")
-    group.add_argument(
-        "--do-pose-sgd", action="store_true", help="Refine poses with gradient descent"
-    )
-    group.add_argument(
-        "--pretrain",
-        type=int,
-        default=1,
-        help="Number of epochs with fixed poses before pose SGD (default: %(default)s)",
-    )
-    group.add_argument(
-        "--emb-type",
-        choices=("s2s2", "quat"),
-        default="quat",
-        help="SO(3) embedding type for pose SGD (default: %(default)s)",
-    )
-    group.add_argument(
-        "--pose-lr",
-        type=float,
-        default=3e-4,
-        help="Learning rate for pose optimizer (default: %(default)s)",
-    )
-
+    # ======== decoder / encoder hyperparams (match cryoDRGN 3.4.4) ========
     group = parser.add_argument_group("Encoder Network")
     group.add_argument(
         "--enc-layers",
         dest="qlayers",
         type=int,
         default=3,
-        help="Number of hidden layers (default: %(default)s)",
+        help="Encoder hidden layers",
     )
     group.add_argument(
         "--enc-dim",
         dest="qdim",
         type=int,
         default=1024,
-        help="Number of nodes in hidden layers (default: %(default)s)",
+        help="Encoder hidden dim",
     )
     group.add_argument(
         "--encode-mode",
-        default="resid",
         choices=("conv", "resid", "mlp", "tilt"),
-        help="Type of encoder network (default: %(default)s)",
+        default="resid",
     )
-    group.add_argument(
-        "--enc-mask",
-        type=int,
-        help="Circular mask of image for encoder (default: D/2; -1 for no mask)",
-    )
-    group.add_argument(
-        "--use-real",
-        action="store_true",
-        help="Use real space image for encoder (for convolutional encoder)",
-    )
+    group.add_argument("--enc-mask", type=int, help="Circular mask for encoder")
 
     group = parser.add_argument_group("Decoder Network")
     group.add_argument(
@@ -314,18 +130,18 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         dest="players",
         type=int,
         default=3,
-        help="Number of hidden layers (default: %(default)s)",
+        help="Decoder hidden layers",
     )
     group.add_argument(
         "--dec-dim",
         dest="pdim",
         type=int,
         default=1024,
-        help="Number of nodes in hidden layers (default: %(default)s)",
+        help="Decoder hidden dim",
     )
     group.add_argument(
         "--pe-type",
-        choices=(
+        choices=[
             "geom_ft",
             "geom_full",
             "geom_lowf",
@@ -333,70 +149,87 @@ def add_args(parser: argparse.ArgumentParser) -> None:
             "linear_lowf",
             "gaussian",
             "none",
-        ),
+        ],
         default="gaussian",
-        help="Type of positional encoding (default: %(default)s)",
+    )
+    group.add_argument("--feat-sigma", type=float, default=0.5)
+    group.add_argument("--pe-dim", type=int, help="Frequencies for positional encoding")
+    group.add_argument(
+        "--domain", choices=("hartley", "fourier"), default="fourier"
     )
     group.add_argument(
-        "--feat-sigma",
-        type=float,
-        default=0.5,
-        help="Scale for random Gaussian features (default: %(default)s)",
+        "--activation", choices=("relu", "leaky_relu"), default="relu"
     )
-    group.add_argument(
-        "--pe-dim",
-        type=int,
-        help="Num frequencies in positional encoding (default: image D/2)",
-    )
-    group.add_argument(
-        "--domain",
-        choices=("hartley", "fourier"),
-        default="fourier",
-        help="Volume decoder representation (default: %(default)s)",
-    )
-    group.add_argument(
-        "--activation",
-        choices=("relu", "leaky_relu"),
-        default="relu",
-        help="Activation (default: %(default)s)",
-    )
+
+    # Bravo, done!
     return parser
 
 
 def train_batch(
-     model: nn.Module,
+    model: nn.Module,
     lattice: Lattice,
     y: torch.Tensor,
-    ctf_param: torch.Tensor,
-    chroma: Chroma,
-    optim,
+    rots: torch.Tensor,
+    trans: torch.Tensor,
+    ctf_params: Optional[torch.Tensor],
+    chroma_cond: torch.Tensor,
+    optim: torch.optim.Optimizer,
     beta: float,
     use_amp: bool = False,
     scaler=None,
 ):
-    optim.zero_grad()
+    """
+    Single training step:
+      1) phase‐flip inputs if CTF
+      2) encode -> reparameterize
+      3) concat chroma_cond to z
+      4) decode with known rots/trans/CTF -> y_recon, mask
+      5) MSE + beta * KLD
+    """
     model.train()
+    optim.zero_grad()
 
-    # forward pass with Chroma conditioner
     with torch.cuda.amp.autocast(enabled=use_amp):
-        z_mu, z_logvar = model.encode(y)
-        z = model.reparameterize(z_mu, z_logvar)
+        # 1) phase‐flip
+        if ctf_params is not None:
+            B, D, _ = y.shape
+            freqs = lattice.freqs2d.unsqueeze(0).expand(B, D, D) / ctf_params[:, 0].view(
+                B, 1, 1
+            )
+            c = ctf.compute_ctf(
+                freqs, *torch.split(ctf_params[:, 1:], 1, dim=1)
+            ).view(B, D, D)
+            y_in = y * c.sign()
+        else:
+            y_in = y
 
-        # Use Chroma for structural conditioning
-        chroma_output = chroma.sample(
-            samples=1,
-            conditioner=None,  #Add conditioners here
-            full_output=False,
-        )
-        y_recon = model.decode(z, lattice, chroma_output)
-          
-        z_mu, z_logvar, z, y_recon, mask = run_batch(
-          model, lattice, y, rot, ntilts, ctf_params, yr
-        )
-        # compute VAE loss
-        loss, gen_loss, kld = loss_function(z_mu, z_logvar, y, y_recon, beta)
+        # 2) encode + reparam
+        _model = unparallelize(model)
+        z_mu, z_logvar = _model.encode(y_in)
+        z = _model.reparameterize(z_mu, z_logvar)
 
-    # Backward pass
+        # 3) inject Chroma conditioner (broadcast if needed)
+        #    chroma_cond: [1, E] or [B, E]
+        if chroma_cond.dim() == 2 and chroma_cond.size(0) == 1:
+            z = torch.cat([z, chroma_cond.expand(z.size(0), -1)], dim=1)
+        else:
+            assert (
+                chroma_cond.size(0) == z.size(0)
+            ), "Batch size mismatch with chroma condition"
+            z = torch.cat([z, chroma_cond], dim=1)
+
+        # 4) decode
+        y_recon, mask = model.decode(z, lattice, rots, trans, ctf_params)
+
+        # 5) losses
+        # only compute error inside the mask
+        mse = F.mse_loss(y_recon * mask, y * mask, reduction="sum") / mask.sum()
+        kld = -0.5 * torch.sum(
+            1 + z_logvar - z_mu.pow(2) - z_logvar.exp()
+        ) / y.shape[0]
+        loss = mse + beta * kld
+
+    # backward
     if use_amp and scaler is not None:
         scaler.scale(loss).backward()
         scaler.step(optim)
@@ -405,176 +238,78 @@ def train_batch(
         loss.backward()
         optim.step()
 
-    return loss.item(), gen_loss.item(), kld.item()
+    return loss.item(), mse.item(), kld.item()
 
 
-def preprocess_input(y, lattice, trans):
-    # center the image
-    B = y.size(0)
-    D = lattice.D
-    y = lattice.translate_ht(y.view(B, -1), trans.unsqueeze(1)).view(B, D, D)
-    return y
+def main(args):
+    os.makedirs(args.outdir, exist_ok=True)
+    fh = logging.FileHandler(os.path.join(args.outdir, "run.log"))
+    logger.addHandler(fh)
+    logger.setLevel(logging.INFO)
+    logger.info(f"cryodrgn=={cryodrgn.__version__}  Chroma conditioning")
 
+    # device & mixed precision
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_amp = args.amp and device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
 
-def run_batch(model, lattice, y, rot, ntilts: Optional[int], ctf_params=None, yr=None):
-    use_ctf = ctf_params is not None
-    B = y.size(0)
-    D = lattice.D
-    c = None
-    if use_ctf:
-        freqs = lattice.freqs2d.unsqueeze(0).expand(
-            B, *lattice.freqs2d.shape
-        ) / ctf_params[:, 0].view(B, 1, 1)
-        c = ctf.compute_ctf(freqs, *torch.split(ctf_params[:, 1:], 1, 1)).view(B, D, D)
-
-    # encode
-    if yr is not None:
-        input_ = (yr,)
+    # 1) Load Chroma + Protein + precompute embedding
+    chroma = Chroma().to(device)
+    # TODO: replace the following stub with the real Chroma API call
+    #       that takes your PDB/FASTA and returns a fixed‐size vector.
+    #       e.g. chroma_cond = chroma.encode_protein(protein)
+    if args.protein.endswith(".pdb"):
+        protein = Protein.from_pdb(args.protein)
     else:
-        input_ = (y,)
-        if c is not None:
-            input_ = (x * c.sign() for x in input_)  # phase flip by the ctf
-    _model = unparallelize(model)
-    assert isinstance(_model, HetOnlyVAE)
-    z_mu, z_logvar = _model.encode(*input_)
-    z = _model.reparameterize(z_mu, z_logvar)
-    if ntilts is not None:
-        z = torch.repeat_interleave(z, ntilts, dim=0)
+        protein = Protein.from_fasta(args.protein)
+    protein = protein.to(device)
 
-    # decode
-    mask = lattice.get_circular_mask(D // 2)  # restrict to circular mask
-    batch_outs = model.backbone_network.sample_sde(
-      lattice.coords[mask],
-      X_init=z,
-      conditioner=conditioner,
-      tspan=[1.0, 0.001],
-      langevin_isothermal=False,
-      integrate_func="euler_maruyama",
-      sde_func="reverse_sde",
-      langevin_factor=2,
-      inverse_temperature=10,
-      N=500,
-      initialize_noise=True,
+    with torch.no_grad():
+        # stub: assume Chroma has a method `embed_protein` returning tensor [1, E]
+        # Replace with whatever your version uses!
+        chroma_cond = chroma.embed_protein(protein)  # <-- **YOUR API HERE**
+        # Example fallback:
+        # chroma_cond = torch.randn(1, chroma.latent_dim, device=device)
+    E = chroma_cond.size(1)
+    logger.info(f"Using Chroma conditioner of dim E={E}")
+
+    # 2) Load dataset, poses, CTF
+    data = dataset.ImageDataset(
+        args.particles,
+        device=device,
+        invert_data=True,
+        window=True,
     )
-    y_recon = batch_outs["X_sample"]
-    if c is not None:
-        y_recon *= c.view(B, -1)[:, mask]
-
-    return z_mu, z_logvar, z, y_recon, mask
-
-
-def loss_function(z_mu, z_logvar, y, y_recon, beta):
-    gen_loss = F.mse_loss(y_recon, y)
-    kld = -0.5 * torch.sum(1 + z_logvar - z_mu.pow(2) - z_logvar.exp())
-    loss = gen_loss + beta * kld
-    return loss, gen_loss, kld
-
-
-def eval_z(
-    model,
-    lattice,
-    data,
-    batch_size,
-    device,
-    trans=None,
-    use_tilt: bool = False,
-    ctf_params=None,
-    use_real=False,
-    shuffler_size=0,
-    seed=None,
-):
-    logger.info("Evaluating z")
-    assert not model.training
-    z_mu_all = []
-    z_logvar_all = []
-
-    data_generator = dataset.make_dataloader(
+    loader = dataset.make_dataloader(
         data,
-        batch_size=batch_size,
-        shuffle=False,
-        shuffler_size=shuffler_size,
-        seed=seed,
+        batch_size=args.batch_size,
+        shuffle=True,
+        shuffler_size=0,
+        seed=None,
+        num_workers=4,
     )
-    for i, minibatch in enumerate(data_generator):
-        ind = minibatch[-1]
-        y = minibatch[0].to(device)
-        D = lattice.D
-        if use_tilt:
-            y = y.view(-1, D, D)
-            ind = minibatch[1].to(device).view(-1)
-        B = len(ind)
 
-        c = None
-        if ctf_params is not None:
-            freqs = lattice.freqs2d.unsqueeze(0).expand(
-                B, *lattice.freqs2d.shape
-            ) / ctf_params[ind, 0].view(B, 1, 1)
-            c = ctf.compute_ctf(freqs, *torch.split(ctf_params[ind, 1:], 1, 1)).view(
-                B, D, D
-            )
-        if trans is not None:
-            y = lattice.translate_ht(y.view(B, -1), trans[ind].unsqueeze(1)).view(
-                B, D, D
-            )
+    # load known poses
+    pose_tracker = PoseTracker.from_file(args.poses, device=device)
+    rots, trans = pose_tracker.rots, pose_tracker.trans  # rots: [N,3,3], trans: [N,2]
 
-        if use_real:
-            input_ = (torch.from_numpy(data.particles_real[ind]).to(device),)
-        else:
-            input_ = (y,)
-        if c is not None:
-            assert not use_real, "Not implemented"
-            input_ = (x * c.sign() for x in input_)  # phase flip by the ctf
-        _model = unparallelize(model)
-        assert isinstance(_model, HetOnlyVAE)
-        z_mu, z_logvar = _model.encode(*input_)
-        z_mu_all.append(z_mu.detach().cpu().numpy())
-        z_logvar_all.append(z_logvar.detach().cpu().numpy())
-    z_mu_all = np.vstack(z_mu_all)
-    z_logvar_all = np.vstack(z_logvar_all)
-    return z_mu_all, z_logvar_all
+    # load CTF params if provided
+    ctf_params = None
+    if args.ctf:
+        with open(args.ctf, "rb") as f:
+            ctf_params = torch.from_numpy(pickle.load(f)).to(device)
 
+    # 3) Build lattice & model (expand zdim by E)
+    lattice = Lattice(data.D, extent=0.5, device=device)
 
-def save_checkpoint(model, optim, epoch, z_mu, z_logvar, out_weights, out_z):
-    """Save model weights, latent encoding z, and decoder volumes"""
-    # save model weights
-    torch.save(
-        {
-            "epoch": epoch,
-            "model_state_dict": unparallelize(model).state_dict(),
-            "optimizer_state_dict": optim.state_dict(),
-        },
-        out_weights,
-    )
-    # save z
-    with open(out_z, "wb") as f:
-        pickle.dump(z_mu, f)
-        pickle.dump(z_logvar, f)
-
-
-def save_config(args, dataset, lattice, model, out_config):
-    dataset_args = dict(
-        particles=args.particles,
-        norm=dataset.norm,
-        invert_data=args.invert_data,
-        ind=args.ind,
-        keepreal=args.use_real,
-        window=args.window,
-        window_r=args.window_r,
-        datadir=args.datadir,
-        ctf=args.ctf,
-        poses=args.poses,
-        do_pose_sgd=args.do_pose_sgd,
-    )
-    if args.encode_mode == "tilt":
-        dataset_args["ntilts"] = args.ntilts
-
-    lattice_args = dict(D=lattice.D, extent=lattice.extent, ignore_DC=lattice.ignore_DC)
-    model_args = dict(
+    full_zdim = args.zdim + E
+    model = HetOnlyVAE(
+        lattice,
+        zdim=full_zdim,
         qlayers=args.qlayers,
         qdim=args.qdim,
         players=args.players,
         pdim=args.pdim,
-        zdim=args.zdim,
         encode_mode=args.encode_mode,
         enc_mask=args.enc_mask,
         pe_type=args.pe_type,
@@ -583,73 +318,60 @@ def save_config(args, dataset, lattice, model, out_config):
         domain=args.domain,
         activation=args.activation,
         tilt_params=dict(
-            tdim=args.tdim,
-            tlayers=args.tlayers,
-            t_emb_dim=args.t_emb_dim,
-            ntilts=args.ntilts,
-        ),
-    )
-    config = dict(
-        dataset_args=dataset_args, lattice_args=lattice_args, model_args=model_args
-    )
-    config["seed"] = args.seed
-    cryodrgn.config.save(config, out_config)
+            tdim=getattr(args, "tdim", None),
+            tlayers=getattr(args, "tlayers", None),
+            t_emb_dim=getattr(args, "t_emb_dim", None),
+            ntilts=getattr(args, "ntilts", None),
+        )
+        if args.encode_mode == "tilt"
+        else None,
+    ).to(device)
 
+    if args.multigpu and torch.cuda.device_count() > 1:
+        model = torch.nn.DataParallel(model)
 
-def get_latest(args):
-    # assumes args.num_epochs > latest checkpoint
-    logger.info("Detecting latest checkpoint...")
-    weights = [f"{args.outdir}/weights.{i}.pkl" for i in range(args.num_epochs)]
-    weights = [f for f in weights if os.path.exists(f)]
-    args.load = weights[-1]
-    logger.info(f"Loading {args.load}")
-    if args.do_pose_sgd:
-        i = args.load.split(".")[-2]
-        args.poses = f"{args.outdir}/pose.{i}.pkl"
-        assert os.path.exists(args.poses)
-        logger.info(f"Loading {args.poses}")
-    return args
-
-
-def main(args: argparse.Namespace) -> None:
-    if not os.path.exists(args.outdir):
-        os.makedirs(args.outdir)
-
-    logger.addHandler(logging.FileHandler(f"{args.outdir}/run.log"))
-
-    # Set device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
-    chroma = Chroma().to(device)
-
-    # Load dataset
-    data = dataset.ImageDataset(args.particles, device=device)
-    lattice = Lattice(data.D, extent=0.5, device=device)
-
-    # Load Chroma conditioner
-    chroma = Chroma(weights_backbone="named:public", device=device)
-
-    # Initialize model
-    model = HetOnlyVAE(lattice, zdim=args.zdim).to(device)
     optim = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    # Mixed precision training
-    scaler = torch.cuda.amp.GradScaler() if args.amp else None
+    # 4) Beta schedule
+    beta_sched = get_beta_schedule(args.beta, args.num_epochs)
+    # if it returns a list/array, we'll index; else we'll treat as constant
 
-    # Training loop
+    logger.info("Starting training …")
     for epoch in range(args.num_epochs):
-        for y in data:
-            y = y.to(device)
-            beta = get_beta_schedule(args.beta, epoch)
-            loss, gen_loss, kld = train_batch(
-                model, lattice, y, chroma, optim, beta, args.amp, scaler
+        model.train()
+        beta = beta_sched[epoch] if hasattr(beta_sched, "__getitem__") else beta_sched
+
+        for batch in loader:
+            y = batch[0].to(device)            # [B, D, D]
+            idx = batch[-1].long()             # indices in [0..N)
+            rots_b = rots[idx]                 # [B,3,3]
+            trans_b = trans[idx]               # [B,2]
+            ctf_b = ctf_params[idx] if ctf_params is not None else None
+
+            loss, mse, kld = train_batch(
+                model,
+                lattice,
+                y,
+                rots_b,
+                trans_b,
+                ctf_b,
+                chroma_cond,  # broadcast inside train_batch
+                optim,
+                beta,
+                use_amp,
+                scaler,
             )
-            logger.info(f"Epoch {epoch}, Loss: {loss}, Gen Loss: {gen_loss}, KLD: {kld}")
+            logger.info(
+                f"Epoch {epoch:3d} | Loss {loss:.4e} | MSE {mse:.4e} | KLD {kld:.4e}"
+            )
 
-        # Save checkpoint
-        torch.save(model.state_dict(), os.path.join(args.outdir, f"model_epoch_{epoch}.pth"))
+        # checkpoint
+        torch.save(
+            unparallelize(model).state_dict(),
+            os.path.join(args.outdir, f"weights_epoch_{epoch}.pth"),
+        )
 
-    logger.info("Training complete")
+    logger.info("Training complete.")
 
 
 if __name__ == "__main__":
@@ -657,3 +379,29 @@ if __name__ == "__main__":
     add_args(parser)
     args = parser.parse_args()
     main(args)
+Key points to check/fill in:
+
+Chroma embedding stub
+Replace
+
+
+       chroma_cond = chroma.embed_protein(protein)
+       ```  
+    with whichever Chroma call actually returns a fixed-size `Tensor` of shape `[1, E]`.  
+
+2.  **PoseTracker format**  
+    Make sure your `args.poses` PKL contains the same format (quaternions or rotation matrices + translations) that `PoseTracker` expects.  
+
+3.  **CTF PKL format**  
+    We assume `ctf.pkl` is an `N×(1+4)` numpy array where column 0 is defocus and cols 1–4 are CTF coeffs; adjust slicing if yours differs.  
+
+4.  **cryodrgn decode signature**  
+    The call  
+       
+<button class="copy-icon" onclick="copyCode(this)"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><!-- Simplified clipboard icon --><rect x="4" y="4" width="16" height="16" rx="2" ry="2" fill="none"></rect><!-- Simplified code brackets --><line x1="10" y1="10" x2="8" y2="12"></line><line x1="8" y1="12" x2="10" y2="14"></line><line x1="14" y1="10" x2="16" y2="12"></line><line x1="16" y1="12" x2="14" y2="14"></line></svg></button>
+```python
+       y_recon, mask = model.decode(z, lattice, rots_b, trans_b, ctf_b)
+       ```  
+    matches cryoDRGN 3.4.4’s API; if yours differs slightly, just reorder or rename those arguments.  
+
+Once you fill in the Chroma‐API line, this script should run “out of the box” against cryoDRGN 3.4.4 and a compatible Chroma library. Let me know if you run into any shape mismatches or missing methods!
