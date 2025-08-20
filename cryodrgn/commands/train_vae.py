@@ -179,7 +179,7 @@ def train_batch(
     scaler=None,
 ):
     """
-    Single training step:
+    Sequence of processes in each training step:
       1) phase‐flip inputs if CTF
       2) encode -> reparameterize
       3) concat chroma_cond to z
@@ -190,7 +190,7 @@ def train_batch(
     optim.zero_grad()
 
     with torch.cuda.amp.autocast(enabled=use_amp):
-        # 1) phase‐flip
+        #1) phase‐flip
         if ctf_params is not None:
             B, D, _ = y.shape
             freqs = lattice.freqs2d.unsqueeze(0).expand(B, D, D) / ctf_params[:, 0].view(
@@ -203,13 +203,13 @@ def train_batch(
         else:
             y_in = y
 
-        # 2) encode + reparam
+        #2) encode + reparam
         _model = unparallelize(model)
         z_mu, z_logvar = _model.encode(y_in)
         z = _model.reparameterize(z_mu, z_logvar)
 
-        # 3) inject Chroma conditioner (broadcast if needed)
-        #    chroma_cond: [1, E] or [B, E]
+        #3) inject Chroma conditioner (broadcast if needed)
+        #chroma_cond: [1, E] or [B, E]
         if chroma_cond.dim() == 2 and chroma_cond.size(0) == 1:
             z = torch.cat([z, chroma_cond.expand(z.size(0), -1)], dim=1)
         else:
@@ -218,18 +218,18 @@ def train_batch(
             ), "Batch size mismatch with chroma condition"
             z = torch.cat([z, chroma_cond], dim=1)
 
-        # 4) decode
+        #4) decode
         y_recon, mask = model.decode(z, lattice, rots, trans, ctf_params)
 
-        # 5) losses
-        # only compute error inside the mask
+        #5) losses
+        #only compute error inside the mask
         mse = F.mse_loss(y_recon * mask, y * mask, reduction="sum") / mask.sum()
         kld = -0.5 * torch.sum(
             1 + z_logvar - z_mu.pow(2) - z_logvar.exp()
         ) / y.shape[0]
         loss = mse + beta * kld
 
-    # backward
+    #backward
     if use_amp and scaler is not None:
         scaler.scale(loss).backward()
         scaler.step(optim)
@@ -248,12 +248,12 @@ def main(args):
     logger.setLevel(logging.INFO)
     logger.info(f"cryodrgn=={cryodrgn.__version__}  Chroma conditioning")
 
-    # device & mixed precision
+    #device & mixed precision
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = args.amp and device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler() if use_amp else None
 
-    # 1) Load Chroma + Protein + precompute embedding
+    #1) Load Chroma + Protein + precompute embedding
     chroma = Chroma().to(device)
     # TODO: replace the following stub with the real Chroma API call
     #       that takes your PDB/FASTA and returns a fixed‐size vector.
@@ -289,17 +289,17 @@ def main(args):
         num_workers=4,
     )
 
-    # load known poses
+    #load known poses
     pose_tracker = PoseTracker.from_file(args.poses, device=device)
     rots, trans = pose_tracker.rots, pose_tracker.trans  # rots: [N,3,3], trans: [N,2]
 
-    # load CTF params if provided
+    #load CTF params if provided
     ctf_params = None
     if args.ctf:
         with open(args.ctf, "rb") as f:
             ctf_params = torch.from_numpy(pickle.load(f)).to(device)
 
-    # 3) Build lattice & model (expand zdim by E)
+    #3) Build lattice & model (expand zdim by E)
     lattice = Lattice(data.D, extent=0.5, device=device)
 
     full_zdim = args.zdim + E
@@ -332,9 +332,9 @@ def main(args):
 
     optim = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    # 4) Beta schedule
+    #4) Beta schedule
     beta_sched = get_beta_schedule(args.beta, args.num_epochs)
-    # if it returns a list/array, we'll index; else we'll treat as constant
+    #if it returns a list/array, index or treat as constant
 
     logger.info("Starting training …")
     for epoch in range(args.num_epochs):
@@ -342,10 +342,10 @@ def main(args):
         beta = beta_sched[epoch] if hasattr(beta_sched, "__getitem__") else beta_sched
 
         for batch in loader:
-            y = batch[0].to(device)            # [B, D, D]
-            idx = batch[-1].long()             # indices in [0..N)
-            rots_b = rots[idx]                 # [B,3,3]
-            trans_b = trans[idx]               # [B,2]
+            y = batch[0].to(device)            #[B, D, D]
+            idx = batch[-1].long()             #indices in [0..N)
+            rots_b = rots[idx]                 #[B,3,3]
+            trans_b = trans[idx]               #[B,2]
             ctf_b = ctf_params[idx] if ctf_params is not None else None
 
             loss, mse, kld = train_batch(
@@ -355,7 +355,7 @@ def main(args):
                 rots_b,
                 trans_b,
                 ctf_b,
-                chroma_cond,  # broadcast inside train_batch
+                chroma_cond,  #broadcast inside train_batch
                 optim,
                 beta,
                 use_amp,
@@ -365,7 +365,7 @@ def main(args):
                 f"Epoch {epoch:3d} | Loss {loss:.4e} | MSE {mse:.4e} | KLD {kld:.4e}"
             )
 
-        # checkpoint
+        #checkpoint
         torch.save(
             unparallelize(model).state_dict(),
             os.path.join(args.outdir, f"weights_epoch_{epoch}.pth"),
