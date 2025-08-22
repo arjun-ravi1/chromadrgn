@@ -2,7 +2,7 @@
 """
 Train a cryoDRGN VAE with known poses + structural conditioning from Chroma.
 
-Usage example (after installing cryoDRGN 3.4.4 and Chroma):
+Usage example:
 
   $ python train_cryoDRGN_with_Chroma.py \
         particles.mrcs \
@@ -379,14 +379,13 @@ if __name__ == "__main__":
     add_args(parser)
     args = parser.parse_args()
     main(args)
+
+
 Key points to check/fill in:
 
 Chroma embedding stub
 Replace
-
-
-       chroma_cond = chroma.embed_protein(protein)
-       ```  
+       ```
     with whichever Chroma call actually returns a fixed-size `Tensor` of shape `[1, E]`.  
 
 2.  **PoseTracker format**  
