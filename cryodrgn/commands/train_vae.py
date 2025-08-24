@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
 Train a cryoDRGN VAE with known poses + structural conditioning from Chroma.
 
@@ -9,6 +9,7 @@ Usage example:
         --poses angles.pkl \
         --ctf ctf.pkl \
         --protein myprotein.pdb \
+        --chroma-weights /path/to/graphbackbone_weights.pt \
         --outdir outs/with_chroma \
         --zdim 8 \
         --lr 1e-4 \
@@ -35,8 +36,7 @@ from cryodrgn.lattice import Lattice
 from cryodrgn.models import HetOnlyVAE, unparallelize
 from cryodrgn.pose import PoseTracker
 
-from chroma.models import Chroma
-from chroma import Protein
+from chroma.models.graph_backbone import load_model as load_backbone
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +62,13 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         "--protein",
         type=os.path.abspath,
         required=True,
-        help="Protein structure/sequence for Chroma (e.g. .pdb or .fasta)",
+        help="Protein structure for Chroma (.pdb)",
+    )
+    parser.add_argument(
+        "--chroma-weights",
+        type=os.path.abspath,
+        required=True,
+        help="Path to GraphBackbone weights (.pt) for Chroma",
     )
     parser.add_argument(
         "-o", "--outdir", type=os.path.abspath, required=True, help="Output directory"
@@ -101,7 +107,7 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         help="Use DataParallel on multiple GPUs",
     )
 
-    # ======== decoder / encoder hyperparams (match cryoDRGN 3.4.4) ========
+    # ======== decoder / encoder hyperparams (match cryoDRGN 3.4.x) ========
     group = parser.add_argument_group("Encoder Network")
     group.add_argument(
         "--enc-layers",
@@ -160,9 +166,49 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument(
         "--activation", choices=("relu", "leaky_relu"), default="relu"
     )
-
-    # Bravo, done!
     return parser
+
+
+def pdb_to_XC_backbone4(pdb_path: str):
+    """Parse a PDB and return X [1,N,4,3] for atoms N,CA,C,O and C [1,N] chain map."""
+    try:
+        from Bio.PDB import PDBParser
+    except ImportError as e:
+        raise ImportError(
+            "Biopython is required for PDB parsing. Install with `pip install biopython`."
+        ) from e
+
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure("prot", pdb_path)
+    coords = []
+    chains = []
+    chain_id_to_idx = {}
+    next_idx = 1  # 0 can be reserved for padding in some utilities
+    for model in structure:
+        for chain in model:
+            cid = chain.id
+            if cid not in chain_id_to_idx:
+                chain_id_to_idx[cid] = next_idx
+                next_idx += 1
+            cidx = chain_id_to_idx[cid]
+            for res in chain:
+                if res.id[0] != " ":
+                    continue  # skip hetero/water
+                atoms = []
+                for name in ["N", "CA", "C", "O"]:
+                    if name not in res:
+                        atoms = None
+                        break
+                    atoms.append(res[name].get_coord().astype(np.float32))
+                if atoms is None:
+                    continue
+                coords.append(np.stack(atoms, axis=0))  # [4,3]
+                chains.append(cidx)
+    if len(coords) == 0:
+        raise ValueError("No residues parsed from PDB (check input file).")
+    X = torch.from_numpy(np.stack(coords, axis=0)).unsqueeze(0)  # [1,N,4,3]
+    C = torch.tensor(chains, dtype=torch.long).unsqueeze(0)      # [1,N]
+    return X, C
 
 
 def train_batch(
@@ -178,58 +224,41 @@ def train_batch(
     use_amp: bool = False,
     scaler=None,
 ):
-    """
-    Sequence of processes in each training step:
-      1) phase‐flip inputs if CTF
-      2) encode -> reparameterize
-      3) concat chroma_cond to z
-      4) decode with known rots/trans/CTF -> y_recon, mask
-      5) MSE + beta * KLD
-    """
+    """One training step."""
     model.train()
     optim.zero_grad()
 
     with torch.cuda.amp.autocast(enabled=use_amp):
-        #1) phase‐flip
+        # 1) phase-flip if CTF
         if ctf_params is not None:
             B, D, _ = y.shape
-            freqs = lattice.freqs2d.unsqueeze(0).expand(B, D, D) / ctf_params[:, 0].view(
-                B, 1, 1
-            )
-            c = ctf.compute_ctf(
-                freqs, *torch.split(ctf_params[:, 1:], 1, dim=1)
-            ).view(B, D, D)
+            freqs = lattice.freqs2d.unsqueeze(0).expand(B, D, D) / ctf_params[:, 0].view(B, 1, 1)
+            c = ctf.compute_ctf(freqs, *torch.split(ctf_params[:, 1:], 1, dim=1)).view(B, D, D)
             y_in = y * c.sign()
         else:
             y_in = y
 
-        #2) encode + reparam
+        # 2) encode + reparam
         _model = unparallelize(model)
         z_mu, z_logvar = _model.encode(y_in)
         z = _model.reparameterize(z_mu, z_logvar)
 
-        #3) inject Chroma conditioner (broadcast if needed)
-        #chroma_cond: [1, E] or [B, E]
+        # 3) concat Chroma conditioner
         if chroma_cond.dim() == 2 and chroma_cond.size(0) == 1:
             z = torch.cat([z, chroma_cond.expand(z.size(0), -1)], dim=1)
         else:
-            assert (
-                chroma_cond.size(0) == z.size(0)
-            ), "Batch size mismatch with chroma condition"
+            assert chroma_cond.size(0) == z.size(0), "Batch-size mismatch with chroma_cond"
             z = torch.cat([z, chroma_cond], dim=1)
 
-        #4) decode
+        # 4) decode
         y_recon, mask = model.decode(z, lattice, rots, trans, ctf_params)
 
-        #5) losses
-        #only compute error inside the mask
+        # 5) losses (inside mask)
         mse = F.mse_loss(y_recon * mask, y * mask, reduction="sum") / mask.sum()
-        kld = -0.5 * torch.sum(
-            1 + z_logvar - z_mu.pow(2) - z_logvar.exp()
-        ) / y.shape[0]
+        kld = -0.5 * torch.sum(1 + z_logvar - z_mu.pow(2) - z_logvar.exp()) / y.shape[0]
         loss = mse + beta * kld
 
-    #backward
+    # backward
     if use_amp and scaler is not None:
         scaler.scale(loss).backward()
         scaler.step(optim)
@@ -244,32 +273,31 @@ def train_batch(
 def main(args):
     os.makedirs(args.outdir, exist_ok=True)
     fh = logging.FileHandler(os.path.join(args.outdir, "run.log"))
+    fmt = logging.Formatter("%(asctime)s %(levelname)s: %(message)s")
+    fh.setFormatter(fmt)
     logger.addHandler(fh)
     logger.setLevel(logging.INFO)
-    logger.info(f"cryodrgn=={cryodrgn.__version__}  Chroma conditioning")
+    logger.info(f"cryodrgn=={cryodrgn.__version__}  |  Chroma conditioning")
 
-    #device & mixed precision
+    # device & mixed precision
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = args.amp and device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler() if use_amp else None
 
-    #1) Load Chroma + Protein + precompute embedding
-    chroma = Chroma().to(device)
-    # TODO: replace the following stub with the real Chroma API call
-    #       that takes your PDB/FASTA and returns a fixed‐size vector.
-    #       e.g. chroma_cond = chroma.encode_protein(protein)
-    if args.protein.endswith(".pdb"):
-        protein = Protein.from_pdb(args.protein)
-    else:
-        protein = Protein.from_fasta(args.protein)
-    protein = protein.to(device)
+    # 1) Load Chroma GraphBackbone and compute a fixed-size protein embedding
+    chroma = load_backbone(weight_file=args.chroma_weights, device=str(device)).to(device).eval()
+
+    if not args.protein.lower().endswith(".pdb"):
+        raise ValueError("Provide a PDB file for --protein. FASTA alone is not sufficient.")
+    X, C = pdb_to_XC_backbone4(args.protein)
+    X, C = X.to(device), C.to(device)
 
     with torch.no_grad():
-        # stub: assume Chroma has a method `embed_protein` returning tensor [1, E]
-        # Replace with whatever your version uses!
-        chroma_cond = chroma.embed_protein(protein)  # <-- **YOUR API HERE**
-        # Example fallback:
-        # chroma_cond = torch.randn(1, chroma.latent_dim, device=device)
+        # Use the first encoder to produce per-residue embeddings
+        node_h, edge_h, edge_idx, mask_i, mask_ij = chroma.encoders[0](X, C)
+        # Masked mean pool to a fixed-size vector [1, E]
+        denom = mask_i.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        chroma_cond = (mask_i.unsqueeze(-1) * node_h).sum(dim=1) / denom
     E = chroma_cond.size(1)
     logger.info(f"Using Chroma conditioner of dim E={E}")
 
@@ -289,17 +317,17 @@ def main(args):
         num_workers=4,
     )
 
-    #load known poses
+    # Known poses
     pose_tracker = PoseTracker.from_file(args.poses, device=device)
     rots, trans = pose_tracker.rots, pose_tracker.trans  # rots: [N,3,3], trans: [N,2]
 
-    #load CTF params if provided
+    # Optional CTF
     ctf_params = None
     if args.ctf:
         with open(args.ctf, "rb") as f:
             ctf_params = torch.from_numpy(pickle.load(f)).to(device)
 
-    #3) Build lattice & model (expand zdim by E)
+    # 3) Build lattice & model (expand zdim by E)
     lattice = Lattice(data.D, extent=0.5, device=device)
 
     full_zdim = args.zdim + E
@@ -332,9 +360,8 @@ def main(args):
 
     optim = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    #4) Beta schedule
+    # 4) Beta schedule
     beta_sched = get_beta_schedule(args.beta, args.num_epochs)
-    #if it returns a list/array, index or treat as constant
 
     logger.info("Starting training …")
     for epoch in range(args.num_epochs):
@@ -342,10 +369,10 @@ def main(args):
         beta = beta_sched[epoch] if hasattr(beta_sched, "__getitem__") else beta_sched
 
         for batch in loader:
-            y = batch[0].to(device)            #[B, D, D]
-            idx = batch[-1].long()             #indices in [0..N)
-            rots_b = rots[idx]                 #[B,3,3]
-            trans_b = trans[idx]               #[B,2]
+            y = batch[0].to(device)     # [B, D, D]
+            idx = batch[-1].long()      # indices in [0..N)
+            rots_b = rots[idx]          # [B,3,3]
+            trans_b = trans[idx]        # [B,2]
             ctf_b = ctf_params[idx] if ctf_params is not None else None
 
             loss, mse, kld = train_batch(
@@ -355,17 +382,17 @@ def main(args):
                 rots_b,
                 trans_b,
                 ctf_b,
-                chroma_cond,  #broadcast inside train_batch
+                chroma_cond,  # broadcast inside train_batch
                 optim,
                 beta,
                 use_amp,
                 scaler,
             )
             logger.info(
-                f"Epoch {epoch:3d} | Loss {loss:.4e} | MSE {mse:.4e} | KLD {kld:.4e}"
+                f"Epoch {epoch:03d} | Loss {loss:.4e} | MSE {mse:.4e} | KLD {kld:.4e}"
             )
 
-        #checkpoint
+        # checkpoint
         torch.save(
             unparallelize(model).state_dict(),
             os.path.join(args.outdir, f"weights_epoch_{epoch}.pth"),
@@ -379,28 +406,3 @@ if __name__ == "__main__":
     add_args(parser)
     args = parser.parse_args()
     main(args)
-
-
-Key points to check/fill in:
-
-Chroma embedding stub
-Replace
-       ```
-    with whichever Chroma call actually returns a fixed-size `Tensor` of shape `[1, E]`.  
-
-2.  **PoseTracker format**  
-    Make sure your `args.poses` PKL contains the same format (quaternions or rotation matrices + translations) that `PoseTracker` expects.  
-
-3.  **CTF PKL format**  
-    We assume `ctf.pkl` is an `N×(1+4)` numpy array where column 0 is defocus and cols 1–4 are CTF coeffs; adjust slicing if yours differs.  
-
-4.  **cryodrgn decode signature**  
-    The call  
-       
-<button class="copy-icon" onclick="copyCode(this)"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><!-- Simplified clipboard icon --><rect x="4" y="4" width="16" height="16" rx="2" ry="2" fill="none"></rect><!-- Simplified code brackets --><line x1="10" y1="10" x2="8" y2="12"></line><line x1="8" y1="12" x2="10" y2="14"></line><line x1="14" y1="10" x2="16" y2="12"></line><line x1="16" y1="12" x2="14" y2="14"></line></svg></button>
-```python
-       y_recon, mask = model.decode(z, lattice, rots_b, trans_b, ctf_b)
-       ```  
-    matches cryoDRGN 3.4.4’s API; if yours differs slightly, just reorder or rename those arguments.  
-
-Once you fill in the Chroma‐API line, this script should run “out of the box” against cryoDRGN 3.4.4 and a compatible Chroma library. Let me know if you run into any shape mismatches or missing methods!
