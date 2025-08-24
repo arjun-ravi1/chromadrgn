@@ -4,7 +4,7 @@ Train a cryoDRGN VAE with known poses + structural conditioning from Chroma.
 
 Usage example:
 
-  $ python train_cryoDRGN_with_Chroma.py \
+    cryodrgn train_vae \
         particles.mrcs \
         --poses angles.pkl \
         --ctf ctf.pkl \
