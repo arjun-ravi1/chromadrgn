@@ -107,7 +107,6 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         help="Use DataParallel on multiple GPUs",
     )
 
-    # ======== decoder / encoder hyperparams (match cryoDRGN 3.4.x) ========
     group = parser.add_argument_group("Encoder Network")
     group.add_argument(
         "--enc-layers",
