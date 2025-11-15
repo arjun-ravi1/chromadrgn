@@ -17,7 +17,6 @@ Usage example:
         --batch-size 16 \
         --beta 0.5
 """
-
 import argparse
 import os
 import pickle
